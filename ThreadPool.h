@@ -1,5 +1,4 @@
-#ifndef THREAD_POOL_H
-#define THREAD_POOL_H
+#pragma once
 
 #include <vector>
 #include <queue>
@@ -11,51 +10,71 @@
 #include <functional>
 #include <stdexcept>
 
-class ThreadPool {
+class ThreadPool
+{
 public:
-    ThreadPool(size_t);
+    explicit ThreadPool(size_t);
+    ~ThreadPool();
+
     template<class F, class... Args>
     auto enqueue(F&& f, Args&&... args) 
         -> std::future<typename std::result_of<F(Args...)>::type>;
-    ~ThreadPool();
+
+    size_t size() const;
+
+    ThreadPool() = delete;
+    ThreadPool(const ThreadPool &) = delete;
+    ThreadPool(ThreadPool &&) = delete;
+    ThreadPool& operator=(const ThreadPool &) = delete;
+    ThreadPool& operator=(ThreadPool &&) = delete;
 private:
-    // need to keep track of threads so we can join them
-    std::vector< std::thread > workers;
-    // the task queue
-    std::queue< std::function<void()> > tasks;
+    std::vector<std::thread>          m_workers;         // need to keep track of threads so we can join them
+    std::queue<std::function<void()>> m_tasks;           // the task queue
     
     // synchronization
-    std::mutex queue_mutex;
-    std::condition_variable condition;
-    bool stop;
+    std::mutex                        m_queue_mutex;
+    std::condition_variable           m_condition;
+    bool                              m_stop;
 };
  
 // the constructor just launches some amount of workers
 inline ThreadPool::ThreadPool(size_t threads)
-    :   stop(false)
+    :   m_stop(false)
 {
     for(size_t i = 0;i<threads;++i)
-        workers.emplace_back(
+        m_workers.emplace_back(
             [this]
             {
-                for(;;)
+                while(true) //loop until quit
                 {
                     std::function<void()> task;
 
                     {
-                        std::unique_lock<std::mutex> lock(this->queue_mutex);
-                        this->condition.wait(lock,
-                            [this]{ return this->stop || !this->tasks.empty(); });
-                        if(this->stop && this->tasks.empty())
+                        std::unique_lock<std::mutex> lock(this->m_queue_mutex);
+                        this->m_condition.wait(lock,
+                            [this]{ return this->m_stop || !this->m_tasks.empty(); }); //wait until task queue is not empty
+                        if(this->m_stop && this->m_tasks.empty())
                             return;
-                        task = std::move(this->tasks.front());
-                        this->tasks.pop();
+                        task = std::move(this->m_tasks.front());   //take one task
+                        this->m_tasks.pop();
                     }
 
-                    task();
+                    task();   //do the task
                 }
             }
         );
+}
+
+// the destructor joins all threads
+inline ThreadPool::~ThreadPool()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_queue_mutex);
+        m_stop = true;
+    }
+    m_condition.notify_all();
+    for(std::thread &worker: m_workers)
+        worker.join();
 }
 
 // add new work item to the pool
@@ -71,28 +90,19 @@ auto ThreadPool::enqueue(F&& f, Args&&... args)
         
     std::future<return_type> res = task->get_future();
     {
-        std::unique_lock<std::mutex> lock(queue_mutex);
+        std::lock_guard<std::mutex> lock(m_queue_mutex);
 
         // don't allow enqueueing after stopping the pool
-        if(stop)
-            throw std::runtime_error("enqueue on stopped ThreadPool");
+        if(m_stop)
+            throw std::runtime_error("enqueue on m_stopped ThreadPool");
 
-        tasks.emplace([task](){ (*task)(); });
+        m_tasks.emplace([task](){ (*task)(); });
     }
-    condition.notify_one();
+    m_condition.notify_one();
     return res;
 }
 
-// the destructor joins all threads
-inline ThreadPool::~ThreadPool()
+inline size_t ThreadPool::size() const
 {
-    {
-        std::unique_lock<std::mutex> lock(queue_mutex);
-        stop = true;
-    }
-    condition.notify_all();
-    for(std::thread &worker: workers)
-        worker.join();
+    return m_workers.size();
 }
-
-#endif
